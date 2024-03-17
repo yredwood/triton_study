@@ -35,3 +35,8 @@ rot_grad_y = tl.where(tl.arange(0, BLOCK_SIZE) < BLOCK_SIZE//2, _rot_grad_y, -_r
 ## Performance
 - Measure time consumption for the forward and backward computation of rope (lower is better)
 ![FW-BW-performance of rope](rope-fw-bw-performance.png)
+
+```
+# to reproduce
+python rope.py
+```
