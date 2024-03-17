@@ -17,6 +17,7 @@ batch_size = 1
 
 @triton.jit
 def rope_bw_kernel(
+        grad_y_ptr,
         freq_ptr,
         output_ptr,
         n_elements,
@@ -28,13 +29,16 @@ def rope_bw_kernel(
     mask = offsets < n_elements
 
     freq = tl.load(freq_ptr + offsets, mask=mask)
+    grad_y = tl.load(grad_y_ptr + offsets, mask=mask)
     
-    cos = tl.cos(freq)
-    sin = tl.sin(freq)
+    offset_from_middle = block_start + (BLOCK_SIZE//2 + tl.arange(0, BLOCK_SIZE)) % BLOCK_SIZE
+    mask = offset_from_middle < n_elements
+    rot_freq = tl.load(freq_ptr + offset_from_middle, mask=mask)
+    _rot_grad_y = tl.load(grad_y_ptr + offset_from_middle, mask=mask)
+    rot_grad_y = tl.where(tl.arange(0, BLOCK_SIZE) < BLOCK_SIZE//2, _rot_grad_y, -_rot_grad_y)
 
-    sin_sign = tl.where(tl.arange(0, BLOCK_SIZE) < BLOCK_SIZE//2, 1., -1.)
-    x_grad = cos + sin_sign * sin
-    tl.store(output_ptr + offsets, x_grad, mask=mask)
+    grad_x = tl.cos(freq) * grad_y + tl.sin(rot_freq) * rot_grad_y
+    tl.store(output_ptr + offsets, grad_x, mask=mask)
 
 
 @triton.jit
@@ -73,12 +77,12 @@ def _fw_rope(x, freq):
     rope_fw_kernel[grid](x, freq, output, n_elements, BLOCK_SIZE=1024)
     return output
 
-def _bw_rope(freq):
+def _bw_rope(grad_y, freq):
     output = torch.empty_like(freq)
-    assert freq.is_cuda
+    assert freq.is_cuda and grad_y.is_cuda
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    rope_bw_kernel[grid](freq, output, n_elements, BLOCK_SIZE=1024)
+    rope_bw_kernel[grid](grad_y, freq, output, n_elements, BLOCK_SIZE=1024)
     return output
 
 class TritonRope(torch.autograd.Function):
@@ -91,14 +95,14 @@ class TritonRope(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
        freq, = ctx.saved_tensors
-       x_grad = _bw_rope(freq)
-       return grad * x_grad, None
+       x_grad = _bw_rope(grad, freq)
+       return x_grad, None
 
 
 def get_fw_bw(fn, x, freq):
     x = torch.nn.Parameter(x.detach(), requires_grad=True)
     out = fn(x, freq)
-    loss = out.sum()
+    loss = (out ** 2).sum()
     loss.backward()
     return out.squeeze(), x.grad.squeeze()
 
